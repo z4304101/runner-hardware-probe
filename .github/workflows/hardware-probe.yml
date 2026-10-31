@@ -1,0 +1,73 @@
+name: Public hardware probe
+
+'on':
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: hardware-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: ${{ github.repository == 'z4304101/runner-hardware-probe' && github.event.repository.private == false }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    steps:
+      - name: Read hardware capacity only
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          python3 -I -S -B - <<'PY_PROBE'
+          import json, os, sys
+
+          def collect():
+              if sys.platform != 'linux':
+                  raise ValueError('UNSUPPORTED_PLATFORM')
+              with open('/proc/meminfo', 'r', encoding='ascii') as stream:
+                  raw = stream.read(65537)
+              if len(raw) > 65536:
+                  raise ValueError('INPUT_BOUND')
+
+              memory = {}
+              for line in raw.splitlines():
+                  parts = line.split()
+                  if parts and parts[0] in ('MemTotal:', 'MemAvailable:'):
+                      if len(parts) != 3 or parts[2] != 'kB':
+                          raise ValueError('INPUT_FORMAT')
+                      memory[parts[0]] = int(parts[1]) * 1024
+
+              cpu = len(os.sched_getaffinity(0))
+              architecture = os.uname().machine
+              v = os.statvfs('/')
+              metrics = {
+                  'cpu_architecture': architecture,
+                  'cpu_count': cpu,
+                  'memory_total_bytes': memory['MemTotal:'],
+                  'memory_available_bytes': memory['MemAvailable:'],
+                  'disk_total_bytes': v.f_blocks * v.f_frsize,
+                  'disk_available_bytes': v.f_bavail * v.f_frsize}
+
+              if architecture != 'x86_64' or cpu < 1:
+                  raise ValueError('CPU_INVALID')
+              if not (0 < metrics['memory_available_bytes']
+                      <= metrics['memory_total_bytes']):
+                  raise ValueError('MEMORY_INVALID')
+              if not (0 <= metrics['disk_available_bytes']
+                      <= metrics['disk_total_bytes']):
+                  raise ValueError('DISK_INVALID')
+              return metrics
+
+          try:
+              metrics = collect()
+          except (OSError, ValueError, KeyError, TypeError):
+              raise SystemExit(2)
+
+          payload = json.dumps(metrics, ensure_ascii=True, sort_keys=True)
+          if len(payload.encode('utf-8')) > 1024:
+              raise SystemExit(2)
+          print(payload)
+
+          if metrics['disk_available_bytes'] < 10 * 1024 ** 3:
+              raise SystemExit(3)
+          PY_PROBE
