@@ -1,0 +1,388 @@
+# OFFLINE DRAFT ONLY. Do not submit or dispatch without separate approval.
+# Registry metadata verified 2026-10-31; runtime and forced-loss cleanup NOT_RUN.
+name: Public pgvector empty database smoke
+'on':
+  workflow_dispatch:
+    inputs:
+      review_ack:
+        description: Separate image, network, container, cleanup and one-run approval recorded
+        type: boolean
+        required: true
+        default: false
+permissions: {}
+concurrency:
+  group: public-pgvector-empty-smoke
+  cancel-in-progress: false
+jobs:
+  smoke:
+    if: ${{ github.repository == 'z4304101/runner-hardware-probe' && github.event.repository.private == false && inputs.review_ack && github.run_attempt == 1 }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Prepare original public-only controller
+        id: prepare
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" == 1 ]]
+          umask 077
+          work="$RUNNER_TEMP/pgvector-empty-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -- "$work"
+          cat > "$work/smoke.py" <<'PY_CONTROLLER'
+          """PUBLIC INFRASTRUCTURE SMOKE ONLY. Never imports Omni or reads its files."""
+          import hashlib, json, os, re, subprocess, sys, time, uuid
+          from pathlib import Path
+          from datetime import datetime
+
+          IMAGE_TAG = 'pgvector/pgvector:0.8.7-pg16-bookworm'
+          # Platform manifest digest, not the multi-architecture index digest.
+          IMAGE_DIGEST = 'c0cd736fe8b8b5d408db56b780570bac404fe518e66e39de624aa46f9aabc60a'
+          EXPECTED_IMAGE_ID = 'sha256:31c6867f8fd38f4b75885aeb954d43cd4c2be714659d72b0dc4ae55bdcd9e967'
+          GIB = 1073741824
+          MEMORY_BYTES = 384 * 1024**2
+          ROOT = Path(__file__).resolve().parent
+          MODE = sys.argv[1] if len(sys.argv) == 2 else ''
+          BEGIN = time.monotonic()
+          NEXT_SAMPLE = 0.0
+          BASELINE = None
+          CLEANUP_DEADLINE = None
+          SQL_READY_DEADLINE = None
+          MOUNTS = {'/tmp', '/var/run/postgresql', '/var/lib/postgresql/data'}
+
+          class Rejected(RuntimeError):
+              pass
+
+          def emit(phase, **fields):
+              print(json.dumps(dict(phase=phase, **fields), sort_keys=True), flush=True)
+
+          def runner_scope():
+              if (sys.platform != 'linux' or os.uname().machine != 'x86_64' or
+                  os.environ.get('GITHUB_ACTIONS') != 'true' or
+                  os.environ.get('RUNNER_ENVIRONMENT') != 'github-hosted' or
+                  os.environ.get('GITHUB_REPOSITORY') != 'z4304101/runner-hardware-probe' or
+                  os.environ.get('GITHUB_RUN_ATTEMPT') != '1'):
+                  raise Rejected('APPROVED_FRESH_HOSTED_RUNNER_REQUIRED')
+
+          def snapshot(phase, enforce=True):
+              global BASELINE, NEXT_SAMPLE
+              mem = {}
+              for line in Path('/proc/meminfo').read_text().splitlines():
+                  key, *value = line.split()
+                  if key in ('MemTotal:', 'MemAvailable:', 'SwapTotal:', 'SwapFree:'):
+                      mem[key] = int(value[0]) * 1024
+              vm = dict(line.split() for line in Path('/proc/vmstat').read_text().splitlines())
+              fs = os.statvfs('/')
+              row = dict(memory_total_bytes=mem['MemTotal:'],
+                         memory_available_bytes=mem['MemAvailable:'],
+                         disk_available_bytes=fs.f_bavail * fs.f_frsize,
+                         swap_used_bytes=mem['SwapTotal:']-mem['SwapFree:'],
+                         swapout_bytes=int(vm['pswpout']) * os.sysconf('SC_PAGE_SIZE'))
+              if BASELINE is None:
+                  BASELINE = row.copy()
+              emit(phase, **row)
+              NEXT_SAMPLE = time.monotonic() + 5
+              if enforce and (row['disk_available_bytes'] < 10*GIB or
+                              row['memory_available_bytes'] < 2*GIB or
+                              row['swapout_bytes']-BASELINE['swapout_bytes'] > 128*1024**2 or
+                              row['swap_used_bytes']-BASELINE['swap_used_bytes'] > 128*1024**2):
+                  raise Rejected('HOST_RESOURCE_GATE')
+              return row
+
+          def command(args, seconds=10, cleanup=False, check=True):
+              deadline = min(time.monotonic()+seconds,
+                             CLEANUP_DEADLINE if cleanup else BEGIN+150)
+              if not cleanup and SQL_READY_DEADLINE is not None:
+                  deadline = min(deadline, SQL_READY_DEADLINE)
+              if time.monotonic() >= deadline:
+                  raise Rejected('COMMAND_DEADLINE')
+              runner_scope()
+              if not cleanup and time.monotonic() >= NEXT_SAMPLE:
+                  snapshot('before_command')
+              child = subprocess.Popen(['/usr/bin/docker', '--config', str(ROOT/'docker-config'),
+                                        '--host', 'unix:///var/run/docker.sock', *args],
+                                       env={'PATH':'/usr/bin:/bin','HOME':str(ROOT)},
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+              try:
+                  while True:
+                      if time.monotonic() >= deadline:
+                          raise Rejected('COMMAND_TIMEOUT')
+                      if not cleanup and time.monotonic() >= NEXT_SAMPLE:
+                          snapshot('during')
+                      try:
+                          out, err = child.communicate(timeout=max(.01, min(.5, deadline-time.monotonic())))
+                          break
+                      except subprocess.TimeoutExpired:
+                          pass
+              except BaseException:
+                  try:
+                      child.kill()
+                  except ProcessLookupError:
+                      pass
+                  try:
+                      child.communicate(timeout=2)
+                  except subprocess.TimeoutExpired:
+                      emit('docker_client_reap', status='UNKNOWN')
+                      for stream in (child.stdout, child.stderr):
+                          if stream is not None:
+                              stream.close()
+                  raise
+              if len(out) > 65536 or len(err) > 65536:
+                  raise Rejected('COMMAND_OUTPUT_BOUND')
+              if check and child.returncode != 0:
+                  emit('command_failed', operation=args[:2], returncode=child.returncode,
+                       stderr_sha256=hashlib.sha256(err).hexdigest())
+                  raise Rejected('DOCKER_COMMAND_FAILED')
+              return child.returncode, out.decode(), err.decode(errors='replace')
+
+          def data(args, **kwargs):
+              return json.loads(command(args, **kwargs)[1])
+
+          def write_new(name, value):
+              with (ROOT/name).open('x', encoding='utf-8') as stream:
+                  json.dump(value, stream, sort_keys=True)
+
+          def state():
+              return json.loads((ROOT/'intent.json').read_text())
+
+          def check_daemon(s, cleanup=False):
+              current = command(['info', '--format', '{{.ID}}'], cleanup=cleanup)[1].strip()
+              if not current or current != s['daemon_id']:
+                  raise Rejected('DAEMON_ID_CHANGED')
+
+          def owned(s, cleanup=False):
+              check_daemon(s, cleanup)
+              created_file = ROOT/'created.json'
+              expected_id = None
+              if created_file.exists():
+                  expected_id = json.loads(created_file.read_text())['id']
+                  if not re.fullmatch('[0-9a-f]{64}', expected_id):
+                      raise Rejected('RECORDED_CONTAINER_ID_INVALID')
+              selector = ('id='+expected_id if expected_id is not None
+                          else 'name=^/'+s['name']+'$')
+              ids = command(['container', 'ls', '--all', '--no-trunc', '--filter',
+                             selector, '--format', '{{.ID}}'], cleanup=cleanup)[1].split()
+              if not ids:
+                  if expected_id is None:
+                      raise Rejected('CREATE_RESULT_UNKNOWN_NO_FULL_ID')
+                  return None
+              if len(ids) != 1 or not re.fullmatch('[0-9a-f]{64}', ids[0]):
+                  raise Rejected('CONTAINER_ID_UNKNOWN')
+              if expected_id is not None and ids[0] != expected_id:
+                  raise Rejected('CONTAINER_ID_CHANGED')
+              obj = data(['container', 'inspect', ids[0]], cleanup=cleanup)[0]
+              labels = obj['Config'].get('Labels') or {}
+              host = obj['HostConfig']
+              valid = [obj['Id']==ids[0], obj['Name']=='/'+s['name'], obj['Image']==s['image_id'],
+                       all(labels.get(k)==v for k,v in s['labels'].items()),
+                       datetime.fromisoformat(obj['Created'].replace('Z','+00:00')).timestamp() >= s['intent_time']-1,
+                       obj['Config']['User']=='postgres', host['NetworkMode']=='none',
+                       not host.get('Binds'), not host.get('PortBindings'),
+                       host['ReadonlyRootfs'] is True, host['Privileged'] is False,
+                       host.get('CapDrop')==['ALL'],
+                       'no-new-privileges:true' in (host.get('SecurityOpt') or []),
+                       host.get('RestartPolicy', {}).get('Name')=='no',
+                       host['Memory']==MEMORY_BYTES, host['MemorySwap']==MEMORY_BYTES,
+                       host['NanoCpus']==1000000000, host['PidsLimit']==128,
+                       set(host.get('Tmpfs') or {})==MOUNTS,
+                       all(m['Type']=='tmpfs' for m in obj.get('Mounts', []))]
+              if not all(valid):
+                  raise Rejected('OWNERSHIP_OR_BOUNDARY_UNKNOWN')
+              if expected_id is None:
+                  write_new('created.json', {'id': obj['Id'], 'source': 'verified_intent_recovery'})
+              return obj
+
+          def cleanup():
+              global CLEANUP_DEADLINE
+              CLEANUP_DEADLINE = time.monotonic()+25
+              if not (ROOT/'intent.json').exists():
+                  emit('cleanup', status='NO_CONTAINER_INTENT')
+                  return
+              s = state()
+              obj = owned(s, cleanup=True)
+              if obj is None:
+                  emit('cleanup', status='OWNED_CONTAINER_ABSENT_VERIFIED_BY_FULL_ID')
+                  return
+              cid = obj['Id']
+              emit('container_before_cleanup', container_id=cid,
+                   running=obj['State']['Running'], exit_code=obj['State']['ExitCode'],
+                   oom_killed=obj['State'].get('OOMKilled', False))
+              if obj['State']['Running']:
+                  command(['container', 'stop', '--time', '5', cid], seconds=8, cleanup=True)
+              stopped = owned(s, cleanup=True)
+              if stopped is None or stopped['State']['Running']:
+                  raise Rejected('STOP_NOT_CONFIRMED')
+              oom = stopped['State'].get('OOMKilled', False)
+              command(['container', 'rm', cid], seconds=5, cleanup=True)
+              if owned(s, cleanup=True) is not None:
+                  raise Rejected('REMOVAL_NOT_CONFIRMED')
+              emit('cleanup', status='OWNED_CONTAINER_REMOVED', container_id=cid, oom_killed=oom,
+                   volumes_created=0, networks_created=0, image_removal='NOT_ATTEMPTED')
+              if oom:
+                  raise Rejected('CONTAINER_OOM_OBSERVED')
+
+          def psql_args(cid, statement):
+              return ['exec', '--user', 'postgres', '--env', 'PGCONNECT_TIMEOUT=2', cid,
+                      'psql', '-X', '-w', '-h', '/var/run/postgresql', '-p', '5432',
+                      '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-U', 'postgres', '-d', 'smoke',
+                      '-c', statement]
+
+          def sql(s, statement):
+              obj = owned(s)
+              if obj is None or not obj['State']['Running']:
+                  raise Rejected('DATABASE_CONTAINER_NOT_RUNNING')
+              return command(psql_args(obj['Id'], statement), seconds=15)[1].strip()
+
+          def wait_for_sql(s):
+              global SQL_READY_DEADLINE
+              # The entrypoint's temporary init server must not count as ready.
+              deadline = min(time.monotonic()+30, BEGIN+150)
+              SQL_READY_DEADLINE = deadline
+              try:
+                  while time.monotonic() < deadline:
+                      obj = owned(s)
+                      if obj is None or not obj['State']['Running']:
+                          raise Rejected('POSTGRES_EXITED_DURING_INIT')
+                      cid = obj['Id']
+                      pid1 = command(['exec', '--user', 'postgres', cid, 'cat',
+                                      '/proc/1/comm'], seconds=3)[1].strip()
+                      if pid1 == 'postgres':
+                          statement = "SELECT 1,current_database(),current_setting('data_directory')"
+                          rc, out, err = command(psql_args(cid, statement), seconds=3, check=False)
+                          if rc == 0:
+                              if out.strip() != '1|smoke|/tmp/pgdata':
+                                  raise Rejected('SQL_READY_IDENTITY_MISMATCH')
+                              emit('sql_ready', select_1=1, final_postmaster=True,
+                                   database='smoke', data_directory='/tmp/pgdata')
+                              return
+                          transient = any(text in err.lower() for text in (
+                              'no such file or directory', 'connection refused',
+                              'the database system is starting up'))
+                          if rc != 2 or not transient:
+                              emit('sql_readiness_failed', returncode=rc,
+                                   stderr_sha256=hashlib.sha256(err.encode()).hexdigest())
+                              raise Rejected('SQL_READINESS_NONTRANSIENT_FAILURE')
+                      time.sleep(min(1, max(0, deadline-time.monotonic())))
+              except Rejected:
+                  if time.monotonic() >= deadline:
+                      raise Rejected('SQL_READINESS_TIMEOUT') from None
+                  raise
+              finally:
+                  SQL_READY_DEADLINE = None
+              raise Rejected('SQL_READINESS_TIMEOUT')
+
+          def smoke():
+              runner_scope()
+              if not re.fullmatch('[0-9a-f]{64}', IMAGE_DIGEST) or IMAGE_DIGEST == '0'*64:
+                  raise Rejected('IMAGE_DIGEST_NOT_VERIFIED_DO_NOT_RUN')
+              image = IMAGE_TAG+'@sha256:'+IMAGE_DIGEST
+              (ROOT/'docker-config').mkdir(exist_ok=False)
+              before = snapshot('before')
+              # 4 GiB is a provisional download/expanded-layer budget, NOT a measured bound.
+              if before['disk_available_bytes'] < 14*GIB:
+                  raise Rejected('IMAGE_STAGING_BUDGET')
+              daemon = command(['info', '--format', '{{.ID}}'])[1].strip()
+              if not daemon:
+                  raise Rejected('DAEMON_ID_UNKNOWN')
+              command(['image', 'pull', '--quiet', '--platform', 'linux/amd64', image], seconds=60)
+              meta = data(['image', 'inspect', image])[0]
+              if (meta['Os']!='linux' or meta['Architecture']!='amd64' or
+                  meta['Id']!=EXPECTED_IMAGE_ID or meta['Size']>2*GIB or
+                  set(meta['Config'].get('Volumes') or {})!={'/var/lib/postgresql/data'} or
+                  not any(v in (f'pgvector/pgvector@sha256:{IMAGE_DIGEST}',
+                                f'docker.io/pgvector/pgvector@sha256:{IMAGE_DIGEST}')
+                          for v in meta.get('RepoDigests', []))):
+                  raise Rejected('IMAGE_PLATFORM_ID_OR_LAYOUT_UNKNOWN')
+              emit('image_verified', manifest_digest=IMAGE_DIGEST, image_id=meta['Id'],
+                   platform='linux/amd64', expanded_image_bytes=meta['Size'])
+              owner = uuid.uuid4().hex
+              name = 'pgv-smoke-'+owner
+              labels = {'public-smoke.owner': owner, 'public-smoke.scope': 'pgvector3-infra-only'}
+              s = dict(name=name, labels=labels, image_id=meta['Id'], image_ref=image,
+                       daemon_id=daemon, intent_time=time.time())
+              if command(['container','ls','--all','--filter','name=^/'+name+'$',
+                          '--format','{{.ID}}'])[1].strip():
+                  raise Rejected('CONTAINER_NAME_COLLISION')
+              write_new('intent.json', s)
+              args = ['container','create','--pull=never','--name',name,'--user','postgres',
+                      '--network','none','--read-only','--cap-drop','ALL',
+                      '--security-opt','no-new-privileges:true','--ipc','private','--shm-size','32m',
+                      '--memory',str(MEMORY_BYTES),'--memory-swap',str(MEMORY_BYTES),
+                      '--cpus','1','--pids-limit','128','--restart','no',
+                      '--log-driver','local','--log-opt','max-size=1m','--log-opt','max-file=1',
+                      '--tmpfs','/tmp:rw,nosuid,nodev,noexec,size=256m,mode=1777',
+                      '--tmpfs','/var/run/postgresql:rw,nosuid,nodev,noexec,size=16m,mode=1777',
+                      '--tmpfs','/var/lib/postgresql/data:rw,nosuid,nodev,noexec,size=1m,mode=0700',
+                      '--env','PGDATA=/tmp/pgdata','--env','POSTGRES_DB=smoke',
+                      '--env','POSTGRES_HOST_AUTH_METHOD=trust']
+              for key,value in labels.items():
+                  args += ['--label',key+'='+value]
+              args += [image,'postgres','-c','listen_addresses=','-c','shared_buffers=32MB',
+                       '-c','max_connections=10']
+              cid = command(args)[1].strip()
+              if not re.fullmatch('[0-9a-f]{64}',cid):
+                  raise Rejected('CREATE_RESULT_UNKNOWN')
+              write_new('created.json', {'id':cid})
+              if owned(s) is None:
+                  raise Rejected('CREATED_CONTAINER_NOT_FOUND')
+              command(['container','start',cid])
+              wait_for_sql(s)
+              if sql(s,"SELECT count(*) FROM pg_tables WHERE schemaname='public'")!='0':
+                  raise Rejected('DATABASE_NOT_EMPTY')
+              if sql(s,"SELECT current_setting('server_version_num')::int/10000")!='16':
+                  raise Rejected('POSTGRES_MAJOR_MISMATCH')
+              sql(s,'CREATE EXTENSION vector')
+              if sql(s,"SELECT extversion FROM pg_extension WHERE extname='vector'")!='0.8.7':
+                  raise Rejected('VECTOR_EXTENSION_VERSION_MISMATCH')
+              sql(s,"CREATE TABLE public.smoke_vectors(id integer PRIMARY KEY, label text NOT NULL, embedding vector(3) NOT NULL)")
+              sql(s,"INSERT INTO public.smoke_vectors VALUES (1,'origin','[0,0,0]'),(2,'near','[1,0,0]'),(3,'far','[3,4,0]')")
+              if sql(s,'SELECT count(*) FROM public.smoke_vectors WHERE vector_dims(embedding)=3')!='3':
+                  raise Rejected('VECTOR_ROWS_OR_DIMENSIONS_FAILED')
+              rows = json.loads(sql(s,"SELECT json_agg(json_build_array(id,d) ORDER BY d,id) FROM (SELECT id,embedding <-> '[0,0,0]'::vector AS d FROM public.smoke_vectors) q"))
+              if rows != [[1,0],[2,1],[3,5]]:
+                  raise Rejected('EXACT_L2_ORDER_OR_DISTANCE_FAILED')
+              emit('sql_verified', select_1=1, rows=3, dimensions=3, l2_rows=rows,
+                   scope='PUBLIC_SYNTHETIC_INFRA_ONLY_NOT_OMNI_VECTOR')
+
+          if __name__ == '__main__':
+              if MODE not in ('run','cleanup'):
+                  raise SystemExit(2)
+              rc = 0
+              try:
+                  if MODE=='run':
+                      smoke()
+                  else:
+                      cleanup()
+              except BaseException as error:
+                  emit('failure', mode=MODE, reason=str(error) if isinstance(error,Rejected)
+                       else type(error).__name__, status='FAIL')
+                  rc = 1
+              finally:
+                  if MODE=='run':
+                      try:
+                          cleanup()
+                      except BaseException as error:
+                          emit('cleanup', status='FAIL_OR_UNKNOWN', reason=str(error)
+                               if isinstance(error,Rejected) else type(error).__name__)
+                          rc = 1
+                  try:
+                      snapshot('after_'+MODE, enforce=(MODE=='run'))
+                  except BaseException as error:
+                      emit('resource_snapshot', status='UNKNOWN', reason=type(error).__name__)
+                      rc = 1
+              if rc==0 and MODE=='run':
+                  emit('result', status='INFRA_SMOKE_PASS_ONLY', omni_fixture='NOT_ACCEPTED',
+                       omni_vector='NOT_ACCEPTED', hybrid='NOT_RUN', migration='NO-GO')
+              raise SystemExit(rc)
+          PY_CONTROLLER
+          chmod 400 "$work/smoke.py"
+      - name: Execute one independent infrastructure smoke
+        timeout-minutes: 4
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          python3 -I -S -B "$RUNNER_TEMP/pgvector-empty-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/smoke.py" run
+      - name: Always verify cleanup of the exact owned container
+        if: ${{ always() && steps.prepare.conclusion == 'success' }}
+        timeout-minutes: 1
+        shell: bash --noprofile --norc -euo pipefail {0}
+        run: |
+          python3 -I -S -B "$RUNNER_TEMP/pgvector-empty-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/smoke.py" cleanup
