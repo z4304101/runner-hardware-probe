@@ -46,6 +46,7 @@ jobs:
           BASELINE = None
           CLEANUP_DEADLINE = None
           SQL_READY_DEADLINE = None
+          START_DIAGNOSTIC_DEADLINE = None
           MOUNTS = {'/tmp', '/var/run/postgresql', '/var/lib/postgresql/data'}
 
           class Rejected(RuntimeError):
@@ -92,6 +93,8 @@ jobs:
                              CLEANUP_DEADLINE if cleanup else BEGIN+150)
               if not cleanup and SQL_READY_DEADLINE is not None:
                   deadline = min(deadline, SQL_READY_DEADLINE)
+              if not cleanup and START_DIAGNOSTIC_DEADLINE is not None:
+                  deadline = min(deadline, START_DIAGNOSTIC_DEADLINE)
               if time.monotonic() >= deadline:
                   raise Rejected('COMMAND_DEADLINE')
               runner_scope()
@@ -126,11 +129,24 @@ jobs:
                           if stream is not None:
                               stream.close()
                   raise
+              start_failed = (check and child.returncode != 0 and len(args)==3
+                              and args[:2]==['container','start'])
               if len(out) > 65536 or len(err) > 65536:
+                  if start_failed:
+                      try:
+                          diagnose_start_failure(args[2], err, child.returncode)
+                      finally:
+                          raise Rejected('COMMAND_OUTPUT_BOUND')
                   raise Rejected('COMMAND_OUTPUT_BOUND')
               if check and child.returncode != 0:
                   emit('command_failed', operation=args[:2], returncode=child.returncode,
                        stderr_sha256=hashlib.sha256(err).hexdigest())
+                  if start_failed:
+                      try:
+                          diagnose_start_failure(args[2], err, child.returncode)
+                      finally:
+                          # Diagnostics never replace the original failure.
+                          raise Rejected('DOCKER_COMMAND_FAILED')
                   raise Rejected('DOCKER_COMMAND_FAILED')
               return child.returncode, out.decode(), err.decode(errors='replace')
 
@@ -190,6 +206,74 @@ jobs:
               if expected_id is None:
                   write_new('created.json', {'id': obj['Id'], 'source': 'verified_intent_recovery'})
               return obj
+
+          def public_error_summary(value):
+              # Never return free-form stderr/State.Error, paths, tokens or excerpts.
+              if isinstance(value, bytes):
+                  prefix = value[:4096]
+                  truncated = len(value)>4096
+              elif isinstance(value, str):
+                  chunk = value[:4096].encode('utf-8', errors='replace')
+                  prefix = chunk[:4096]
+                  truncated = len(value)>4096 or len(chunk)>4096
+              else:
+                  return {'indicators':['UNKNOWN'], 'raw_detail':'UNKNOWN_REDACTED'}
+              text = prefix.decode('utf-8', errors='replace').lower()
+              patterns = (
+                  ('MOUNT_SETUP', r'mount|mountpoint|duplicate destination'),
+                  ('READ_ONLY_FILESYSTEM', r'read-only file system|\berofs\b'),
+                  ('PERMISSION_DENIED', r'permission denied|operation not permitted|\beacces\b|\beperm\b'),
+                  ('CGROUP_OR_RESOURCE_LIMIT', r'cgroup|resource temporarily unavailable|pids limit'),
+                  ('MEMORY_ALLOCATION', r'out of memory|cannot allocate memory|\benomem\b'),
+                  ('STORAGE_SPACE', r'no space left on device|\benospc\b'),
+                  ('OCI_RUNTIME', r'oci runtime|runc|containerd|failed to create shim'),
+                  ('USER_RESOLUTION', r'unable to find user|no matching entries in passwd|unknown user'),
+                  ('EXECUTION_SETUP', r'exec format error|executable file not found|unable to start container process'),
+                  ('DAEMON_CONNECTION', r'cannot connect to.*docker daemon|error during connect|context deadline exceeded|connection refused'))
+              hits = [name for name,pattern in patterns if re.search(pattern,text)]
+              return {'indicators':hits or ['EMPTY' if not prefix else 'UNKNOWN'],
+                      'raw_detail':'UNKNOWN_REDACTED',
+                      'prefix_bytes':len(prefix), 'prefix_sha256':hashlib.sha256(prefix).hexdigest(),
+                      'truncated':truncated}
+
+          def diagnose_start_failure(cid, cli_stderr, returncode):
+              global START_DIAGNOSTIC_DEADLINE
+              previous = START_DIAGNOSTIC_DEADLINE
+              START_DIAGNOSTIC_DEADLINE = min(time.monotonic()+5, BEGIN+150)
+              result = {'status':'UNKNOWN', 'container_id':'UNKNOWN',
+                        'cli_returncode':returncode if type(returncode) is int else 'UNKNOWN',
+                        'cli_stderr':{'indicators':['UNKNOWN'],'raw_detail':'UNKNOWN_REDACTED'},
+                        'state_error':{'indicators':['UNKNOWN'],'raw_detail':'UNKNOWN_REDACTED'},
+                        'exit_code':'UNKNOWN', 'oom_killed':'UNKNOWN'}
+              try:
+                  result['cli_stderr'] = public_error_summary(cli_stderr)
+                  if not isinstance(cid,str) or not re.fullmatch('[0-9a-f]{64}',cid):
+                      raise Rejected('DIAGNOSTIC_CID_INVALID')
+                  # A diagnostic read must never perform partial-create recovery.
+                  for name,limit in (('intent.json',16384),('created.json',4096)):
+                      receipt = ROOT/name
+                      if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size>limit:
+                          raise Rejected('DIAGNOSTIC_RECEIPT_UNKNOWN')
+                  expected = json.loads((ROOT/'created.json').read_text())['id']
+                  if expected != cid:
+                      raise Rejected('DIAGNOSTIC_CID_MISMATCH')
+                  obj = owned(state())
+                  if obj is None or obj['Id'] != cid:
+                      raise Rejected('DIAGNOSTIC_CONTAINER_UNAVAILABLE')
+                  state_value = obj['State']
+                  exit_value = state_value.get('ExitCode')
+                  oom_value = state_value.get('OOMKilled')
+                  result.update(status='OWNERSHIP_VERIFIED_STATE_READ',
+                                container_id=cid,
+                                state_error=public_error_summary(state_value.get('Error')),
+                                exit_code=exit_value if type(exit_value) is int and 0<=exit_value<=255 else 'UNKNOWN',
+                                oom_killed=oom_value if type(oom_value) is bool else 'UNKNOWN')
+              except BaseException as error:
+                  # No error text: it may contain host paths or credentials.
+                  result['diagnostic_failure'] = type(error).__name__
+              finally:
+                  START_DIAGNOSTIC_DEADLINE = previous
+                  emit('start_failure_diagnostic', **result)
 
           def cleanup():
               global CLEANUP_DEADLINE
